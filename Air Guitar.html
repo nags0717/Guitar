@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Air Guitar</title>
+<style>
+:root{color-scheme:dark;--bg:#0b0d0e;--fg:#e8efe6;--mut:#8a948a;--pn:#161a1c;--bd:#2a3133;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:light){:root:not([data-theme="dark"]){color-scheme:light;--bg:#f4f6f2;--fg:#151a14;--mut:#5b665a;--pn:#fff;--bd:#cfd6cc}}
+:root[data-theme="dark"]{color-scheme:dark}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:13px system-ui,-apple-system,sans-serif}
+body{display:flex;flex-direction:column}
+#bar{display:flex;flex-wrap:wrap;gap:6px 8px;align-items:center;padding:8px;background:var(--pn);border-bottom:1px solid var(--bd)}
+button,select{background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:8px;padding:7px 10px;font:inherit}
+button.on{background:#b6ff3c;color:#101400;border-color:#b6ff3c}
+label{display:flex;gap:5px;align-items:center;color:var(--mut)}
+input[type=range]{width:80px}
+#wrap{flex:1;position:relative;min-height:0}
+#c{position:absolute;inset:0;width:100%;height:100%;touch-action:none}
+#v{display:none}
+#msg{position:absolute;left:10px;bottom:10px;right:10px;color:var(--mut);pointer-events:none;font-size:12px}
+</style></head><body>
+<div id="bar">
+  <button id="mPlay" class="on">Play</button><button id="mDraw">Draw strings</button>
+  <button id="auto">6 strings</button><button id="undo">Undo</button><button id="clear">Clear</button>
+  <button id="hand">✋ Hands</button>
+  <select id="tone"><option value="crunch">Crunch</option><option value="clean">Clean</option><option value="dist">Distortion</option><option value="synth">Synth</option></select>
+  <select id="fm"><option value="frets">Frets</option><option value="slide">Slide</option><option value="off">No fretting</option></select>
+  <select id="sc"><option value="min">Minor pent.</option><option value="maj">Major</option><option value="chrom">Chromatic</option></select>
+  <label>Bend <input id="bend" type="range" min="1" max="12" value="2"></label>
+  <label>Sustain <input id="sus" type="range" min="1" max="6" step=".5" value="3.5"></label>
+  <label>Delay <input id="delay" type="range" min="0" max="100" value="20"></label>
+  <label>Reverb <input id="rev" type="range" min="0" max="100" value="25"></label>
+</div>
+<div id="wrap"><canvas id="c"></canvas><video id="v" playsinline muted></video>
+<div id="msg"></div></div>
+<script>
+const $=id=>document.getElementById(id),cv=$('c'),ctx=cv.getContext('2d'),vid=$('v'),msg=$('msg');
+const NN=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'],SC={min:[0,3,5,7,10],maj:[0,2,4,5,7,9,11],chrom:[0,1,2,3,4,5,6,7,8,9,10,11]};
+let W=1,H=1,strings=[],tmp=null,mode='play',audio,bus,shaper,dwet,rwet,hp=null,handOn=false,pinch=false,hands;
+const ptr={x:0,y:0,px:0,py:0,down:false,g:null};
+const T=()=>audio.currentTime;
+function resize(){const r=cv.parentElement.getBoundingClientRect(),d=devicePixelRatio||1;W=r.width;H=r.height;cv.width=W*d;cv.height=H*d;ctx.setTransform(d,0,0,d,0,0)}
+new ResizeObserver(resize).observe(cv.parentElement);
+const curve=k=>{const c=new Float32Array(1024);for(let i=0;i<1024;i++){const x=i/512-1;c[i]=k?Math.tanh(x*(1+k)):x}return c};
+function startAudio(){
+  if(!audio){
+    audio=new(window.AudioContext||window.webkitAudioContext)();
+    bus=audio.createGain();shaper=audio.createWaveShaper();shaper.oversample='2x';
+    const tone=audio.createBiquadFilter();tone.type='lowpass';tone.frequency.value=6000;
+    const master=audio.createGain();master.gain.value=.6;const comp=audio.createDynamicsCompressor();
+    bus.connect(shaper);shaper.connect(tone);tone.connect(master);
+    const dly=audio.createDelay(1),fb=audio.createGain();dly.delayTime.value=.32;fb.gain.value=.4;dwet=audio.createGain();
+    tone.connect(dly);dly.connect(fb);fb.connect(dly);dly.connect(dwet);dwet.connect(master);
+    const conv=audio.createConvolver(),L=audio.sampleRate*2.2|0,b=audio.createBuffer(2,L,audio.sampleRate);
+    for(let c=0;c<2;c++){const d=b.getChannelData(c);for(let i=0;i<L;i++)d[i]=(Math.random()*2-1)*Math.pow(1-i/L,3)}
+    conv.buffer=b;rwet=audio.createGain();tone.connect(conv);conv.connect(rwet);rwet.connect(master);
+    master.connect(comp);comp.connect(audio.destination);
+  }
+  if(audio.state!=='running')audio.resume();fx();
+}
+function fx(){if(!audio)return;const t=$('tone').value;shaper.curve=curve({clean:0,crunch:6,dist:40,synth:0}[t]);bus.gain.value=t==='dist'?.5:1;dwet.gain.value=$('delay').value/100*.6;rwet.gain.value=$('rev').value/100*.9}
+['tone','delay','rev'].forEach(i=>$(i).oninput=fx);
+const freq=s=>440*2**((s.midi-69)/12);
+function killVoice(s){if(!s.v)return;try{const t=T();s.v.g.gain.cancelScheduledValues(t);s.v.g.gain.setTargetAtTime(0,t,.02);s.v.o1.stop(t+.1);s.v.o2.stop(t+.1)}catch(e){}s.v=null}
+function pluck(s,vel,cents){
+  startAudio();killVoice(s);
+  const t=T(),dec=+$('sus').value,f=freq(s),o1=audio.createOscillator(),o2=audio.createOscillator(),fl=audio.createBiquadFilter(),g=audio.createGain();
+  o1.type=$('tone').value==='synth'?'square':'sawtooth';o2.type='triangle';
+  o1.frequency.value=o2.frequency.value=f;o1.detune.value=cents;o2.detune.value=cents+7;
+  fl.type='lowpass';fl.Q.value=2;fl.frequency.setValueAtTime(Math.min(9000,f*2+vel*f*10),t);fl.frequency.exponentialRampToValueAtTime(Math.max(300,f*1.5),t+dec*.6);
+  g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime(.3*vel,t+.004);g.gain.exponentialRampToValueAtTime(.0008,t+dec);
+  o1.connect(fl);o2.connect(fl);fl.connect(g);g.connect(bus);o1.start(t);o2.start(t);o1.stop(t+dec+.1);o2.stop(t+dec+.1);
+  s.v={o1,o2,g,end:t+dec};s.vib=Math.max(s.vib||0,5+vel*9);
+}
+function setCents(s,c){if(s.v&&T()<s.v.end){s.v.o1.detune.setTargetAtTime(c,T(),.02);s.v.o2.detune.setTargetAtTime(c+7,T(),.02)}}
+const P=s=>({ax:s.a.x*W,ay:s.a.y*H,bx:s.b.x*W,by:s.b.y*H});
+function proj(s,x,y){const{ax,ay,bx,by}=P(s),dx=bx-ax,dy=by-ay,L2=dx*dx+dy*dy||1,t=((x-ax)*dx+(y-ay)*dy)/L2,tc=Math.max(0,Math.min(1,t)),L=Math.sqrt(L2);
+  return{tc,d:Math.hypot(x-(ax+dx*tc),y-(ay+dy*tc)),sd:((x-ax)*-dy+(y-ay)*dx)/L}}
+function cross(s,x1,y1,x2,y2){const{ax,ay,bx,by}=P(s),d1=(bx-ax)*(y1-ay)-(by-ay)*(x1-ax),d2=(bx-ax)*(y2-ay)-(by-ay)*(x2-ax);if(d1*d2>=0)return false;
+  const e1=(x2-x1)*(ay-y1)-(y2-y1)*(ax-x1),e2=(x2-x1)*(by-y1)-(y2-y1)*(bx-x1);return e1*e2<0}
+function grabUpdate(s,x,y){
+  const p=proj(s,x,y),fm=$('fm').value;let fr=0;
+  if(fm!=='off'){fr=p.tc*12;if(fm==='frets')fr=Math.round(fr)}
+  const bend=Math.min(1,Math.abs(p.sd)/(Math.min(W,H)*.22))*$('bend').value;
+  s.gp={x,y,t:Math.max(.1,Math.min(.9,p.tc))};s.fr=fr;s.bn=bend;
+  const c=fr*100+bend*100;setCents(s,c);return c;
+}
+function midiFromY(yn){let m=79-39*yn;const sc=SC[$('sc').value];let best=Math.round(m),bd=99;
+  for(let k=Math.round(m)-6;k<=Math.round(m)+6;k++)if(sc.includes(((k%12)+12)%12)&&Math.abs(k-m)<bd){bd=Math.abs(k-m);best=k}return best}
+function pDown(x,y){
+  ptr.down=true;ptr.x=ptr.px=x;ptr.y=ptr.py=y;
+  if(mode==='draw'){tmp={a:{x:x/W,y:y/H},b:{x:x/W,y:y/H},vib:0}}
+  else{let best=null,bd=24;for(const s of strings){const p=proj(s,x,y);if(p.d<bd){bd=p.d;best=s}}
+    if(best){ptr.g=best;const c=grabUpdate(best,x,y);pluck(best,.85,c)}}
+}
+function pMove(x,y){
+  ptr.px=ptr.x;ptr.py=ptr.y;ptr.x=x;ptr.y=y;
+  if(mode==='draw'){if(tmp&&ptr.down)tmp.b={x:x/W,y:y/H};return}
+  if(ptr.g){grabUpdate(ptr.g,x,y);return}
+  const sp=Math.hypot(x-ptr.px,y-ptr.py);
+  for(const s of strings)if(cross(s,ptr.px,ptr.py,x,y))pluck(s,Math.min(1,Math.max(.3,sp/40)),0);
+}
+function pUp(){
+  ptr.down=false;
+  if(ptr.g){const s=ptr.g;ptr.g=null;s.gp=null;setCents(s,s.fr*100);s.vib=10+(s.bn||0)*8}
+  if(tmp){const L=Math.hypot((tmp.b.x-tmp.a.x)*W,(tmp.b.y-tmp.a.y)*H);
+    if(L>60){tmp.midi=midiFromY((tmp.a.y+tmp.b.y)/2);strings.push(tmp);pluck(tmp,.7,0)}tmp=null}
+}
+const xy=e=>{const r=cv.getBoundingClientRect();return[e.clientX-r.left,e.clientY-r.top]};
+cv.addEventListener('pointerdown',e=>{startAudio();cv.setPointerCapture(e.pointerId);pDown(...xy(e))});
+cv.addEventListener('pointermove',e=>{if(e.pointerType==='mouse'||ptr.down)pMove(...xy(e))});
+cv.addEventListener('pointerup',pUp);cv.addEventListener('pointercancel',pUp);
+function setMode(m){mode=m;ptr.g=null;tmp=null;$('mPlay').classList.toggle('on',m==='play');$('mDraw').classList.toggle('on',m==='draw');
+  msg.textContent=m==='draw'?'Drag (or pinch and drag with your hand) to draw a string. Longer strings are fine; height sets the note.':'Swipe across strings to strum. Grab a string, pull it away to bend the pitch, slide along it to fret, then let go.'}
+$('mPlay').onclick=()=>setMode('play');$('mDraw').onclick=()=>setMode('draw');
+$('auto').onclick=()=>{[64,59,55,50,45,40].forEach((m,i)=>0);strings=[64,59,55,50,45,40].map((m,i)=>({a:{x:.08,y:.2+.12*i},b:{x:.92,y:.2+.12*i},midi:m,vib:0}));setMode('play')};
+$('undo').onclick=()=>{const s=strings.pop();if(s&&audio)killVoice(s)};
+$('clear').onclick=()=>{if(audio)strings.forEach(killVoice);strings=[]};
+function drawStr(s,dt,live){
+  const{ax,ay,bx,by}=P(s),L=Math.hypot(bx-ax,by-ay)||1,nx=-(by-ay)/L,ny=(bx-ax)/L;let cx=(ax+bx)/2,cy=(ay+by)/2;
+  if(s.gp){const t=s.gp.t,k=2*t*(1-t);cx=(s.gp.x-(1-t)*(1-t)*ax-t*t*bx)/k;cy=(s.gp.y-(1-t)*(1-t)*ay-t*t*by)/k}
+  else if(s.vib>.3){s.ph=(s.ph||0)+dt*(40+(s.midi%24)*2);const o=s.vib*Math.sin(s.ph);cx+=nx*o*2;cy+=ny*o*2;s.vib*=Math.exp(-dt*2.2)}
+  const act=s.gp||s.vib>.3,w=Math.max(2,Math.min(7,2+(79-s.midi)/9));
+  const path=()=>{ctx.beginPath();ctx.moveTo(ax,ay);ctx.quadraticCurveTo(cx,cy,bx,by)};
+  ctx.lineCap='round';
+  if(act){ctx.shadowColor='#b6ff3c';ctx.shadowBlur=14;ctx.strokeStyle='#76b800';ctx.lineWidth=w+3;path();ctx.stroke();ctx.shadowBlur=0}
+  ctx.strokeStyle=act?'#b6ff3c':live?'#ffffff':'#9aa59a';ctx.lineWidth=w;path();ctx.stroke();
+  if(act){ctx.strokeStyle='rgba(255,255,255,.6)';ctx.lineWidth=1.2;ctx.save();ctx.translate(-1,-1);path();ctx.stroke();ctx.restore()}
+  if(mode==='play'&&$('fm').value!=='off'&&!live){ctx.fillStyle='rgba(138,148,138,.6)';for(let i=1;i<=12;i++){const t=i/12;ctx.beginPath();ctx.arc(ax+(bx-ax)*t,ay+(by-ay)*t+10,i%12===0?3:1.8,0,7);ctx.fill()}}
+  if(!live){ctx.fillStyle='#8a948a';ctx.font='11px monospace';ctx.fillText(NN[s.midi%12]+(Math.floor(s.midi/12)-1),Math.min(ax,bx)+4,(ay+by)/2-8)}
+  if(s.gp){ctx.fillStyle='#b6ff3c';ctx.font='12px monospace';ctx.fillText('fret '+Math.round(s.fr)+'  bend +'+s.bn.toFixed(1),s.gp.x+14,s.gp.y-12)}
+}
+let last=performance.now();
+function frame(now){
+  const dt=Math.min(.05,(now-last)/1000);last=now;ctx.clearRect(0,0,W,H);
+  if(handOn&&vid.readyState>1){ctx.save();ctx.translate(W,0);ctx.scale(-1,1);ctx.globalAlpha=.75;ctx.drawImage(vid,0,0,W,H);ctx.restore();ctx.globalAlpha=1;ctx.fillStyle='rgba(0,0,0,.3)';ctx.fillRect(0,0,W,H)}
+  strings.forEach(s=>drawStr(s,dt,false));if(tmp)drawStr(tmp.midi?tmp:Object.assign(tmp,{midi:60}),dt,true);
+  if(hp){ctx.strokeStyle=pinch?'#b6ff3c':'#fff';ctx.lineWidth=2;ctx.beginPath();ctx.arc(hp.x*W,hp.y*H,pinch?6:13,0,7);ctx.stroke()}
+  requestAnimationFrame(frame);
+}
+// Hand tracking (works when this file is opened from localhost; the hosted page may block the model download)
+function loadScript(src){return new Promise((res,rej)=>{const s=document.createElement('script');s.src=src;s.crossOrigin='anonymous';s.onload=res;s.onerror=()=>rej(0);document.head.appendChild(s)})}
+async function startHand(){
+  msg.textContent='Starting camera…';
+  try{
+    startAudio();vid.srcObject=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user'}});await vid.play();
+    const base='https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/';
+    await loadScript(base+'hands.js');
+    hands=new Hands({locateFile:f=>base+f});
+    hands.setOptions({maxNumHands:1,modelComplexity:1,minDetectionConfidence:.6,minTrackingConfidence:.5});
+    hands.onResults(onHand);await hands.initialize();
+    handOn=true;$('hand').classList.add('on');setMode(mode);
+    (async()=>{while(handOn){await hands.send({image:vid});await new Promise(r=>requestAnimationFrame(r))}})();
+  }catch(err){stopHand();msg.textContent='Hand tracking couldn’t start here (camera or model blocked). Mouse and touch still work; run the file on localhost for hands.'}
+}
+function stopHand(){handOn=false;hp=null;if(pinch){pUp();pinch=false}$('hand').classList.remove('on');if(vid.srcObject){vid.srcObject.getTracks().forEach(t=>t.stop());vid.srcObject=null}}
+function onHand(r){
+  const l=r.multiHandLandmarks&&r.multiHandLandmarks[0];
+  if(!l){hp=null;if(pinch){pUp();pinch=false}return}
+  const i=l[8],t=l[4],p={x:1-i.x,y:i.y};hp=hp?{x:hp.x+(p.x-hp.x)*.5,y:hp.y+(p.y-hp.y)*.5}:p;
+  const d=Math.hypot(i.x-t.x,i.y-t.y),on=pinch?d<.09:d<.06,x=hp.x*W,y=hp.y*H;
+  if(on&&!pinch)pDown(x,y);else if(!on&&pinch)pUp();else pMove(x,y);
+  pinch=on;
+}
+$('hand').onclick=()=>handOn?(stopHand(),setMode(mode)):startHand();
+resize();$('auto').click();requestAnimationFrame(frame);
+</script></body></html>
